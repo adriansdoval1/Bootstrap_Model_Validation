@@ -1,0 +1,403 @@
+/*Código que crea Intervalo de Confianza para coeficientes con el método de Bootstrapping Normal*/
+/*Archivo modificado por: */ 
+
+/*10/Agosto/2020 Adrián Sandoval: Se creó la primera versión del código */
+/*27/Agosto/2020 Adrián Sandoval: Se empezó la siguiente versión*/
+
+
+/*Versión 1.- La validación sólo encuentra intervalos de confianza basados en el supuesto de normalidad*/
+/*            Además lo estima únicamente con metodología de Regresión Poisson, Binomial Negativa y Gamma*/
+/*Versión 2.- Tomando en cuenta el feedback de Pedro de Zuviria (México Zurich Chief Pricing Officer) se agregó lo siguiente*/
+/*            a) Histogramas y Boxplot por nivel
+			  b) Nueva metodología basada en percentiles para los intervalos de confianza*/
+/*Versión 3.- Se incluyen más modelos para validar, ahora soporta regresión: Logística, Gamma, Binomial Negativa y Poissson*/
+
+
+
+/**Para hacer pruebas se necesita **/
+/*Correr la parte que dice 1.-Insumos y en el programa 2.-Test viene unas pruebas con esos programas*/
+
+
+%LET _CLIENTTASKLABEL=;
+%LET _CLIENTPROCESSFLOWNAME=;
+%LET _CLIENTPROJECTPATH=;
+%LET _CLIENTPROJECTPATHHOST=;
+%LET _CLIENTPROJECTNAME=;
+%LET _SASPROGRAMFILE=;
+%LET _SASPROGRAMFILEHOST=;
+
+
+%LET _CLIENTTASKLABEL='3.-Macro_Final_v3';
+%LET _CLIENTPROCESSFLOWNAME='Process Flow';
+%LET _CLIENTPROJECTPATH='Y:\Proyectos Especiales\Adrián\03_Proyecto\Fase_1\1.6 Mejorar Validaciones\Bootstrapping\Bootstrapping_v3.egp';
+%LET _CLIENTPROJECTPATHHOST='MXTORL17HMXY2';
+%LET _CLIENTPROJECTNAME='Bootstrapping_v3.egp';
+%LET _SASPROGRAMFILE='';
+%LET _SASPROGRAMFILEHOST='';
+
+/*Macro final*/
+
+
+%macro get_table_size(inset,macvar); /*Macro que mide el tamaño de la base de datos. Esto sirve para poder hacer el remuestreo.*/
+ data _null_; /*_null_ se usa para no escribir nada*/
+  set &inset NOBS=size;/*&inset es la base de datos de la cual queremos saber el tamaño*/
+  call symput("&macvar",size);
+ stop;
+ run;
+%mend;
+
+/*Model_Data= La base donde están todas las variables usadas para el modelo*/
+/*N= Número de iteraciones de la metodología del Bootstrap*/
+/*Var_Dep= Variable Dependiente*/
+/*Var_Indep= Nombres de Variables Independientes*/
+/*ClassDactor= Nombres de Variables Categóricas*/
+/*alpha= Es el % de confiabilidad del Intervalo de Confianza*/
+/*Offset_var= Nombre de la variable offset*/
+/*DIST= Tipo de distribución usada (POISSON, NEGBIN o GAMMA)*/
+/*Weight= Peso de la variable*/
+/*LINK=Selecciona el tipo de función encaje.*/
+/*Tipos de Modelos Soportados*/
+/*1.-REGRESIÓN POISSON (DIST=POISSON y LINK=LOG)*/
+/*2.-REGRESIÓN GAMMA (DIST=GAMMA y LINK=LOG)*/
+/*3.-REGRESIÓN BINOMIAL NEGATIVA (DIST=NEGBIN y LINK=LOG)*/
+/*4.-REGRESIÓN LOGÍSTICA (DIST=BIN y LINK=LOGIT)*/
+/*5.-REGRESIÓN LINEAL MÚLTIPLE (DIST=NORMAL Y LINK=INDETITY)*/
+
+%MACRO BOOTSTRAP_v3(Model_Data,Var_Dep,Var_Indep,N,Class_Factor,alpha,Offset_var,Weight,DIST,LINK);
+	
+	/*Estas macros ayudan a crear variables que van a ayudar a saber el nivel de análisis*/
+	/*Por ejemplo, la variable Class_Factor_Aux resulta en el vector de variables categóricas que serán usadas si el usuario las accesa*/
+	%LET Class_Factor_Aux=%SYSFUNC(IFC(%SYSEVALF(%SUPERQ(Class_Factor)=,boolean),,CLASS &Class_Factor.));
+	%LET Offset_Aux=%SYSFUNC(IFC(%SYSEVALF(%SUPERQ(Offset_var)=,boolean),,OFFSET= &Offset_var.));
+	%LET Weight_aux=%SYSFUNC(IFC(%SYSEVALF(%SUPERQ(weight)=,boolean),,WEIGHT &Weight.));
+	%LET Level1_Aux=%SYSFUNC(IFC(%SYSEVALF(%SUPERQ(Class_Factor)=,boolean),,Level1));
+	%LET Lower=%SYSFUNC(CEIL(%SYSEVALF((&alpha./2)*(&N.+1))));
+	%LET Upper=%SYSFUNC(FLOOR(%SYSEVALF((1-(&alpha./2))*(&N.+1))));
+	
+	%let Inicio = %sysfunc(datetime()); /*Da inicio al contador para medir la duración del bootstrap*/
+
+	%IF %SYSFUNC(EXIST(work.PARAM_ORIG)) %THEN /*Borra el resultado de bases anteriores para no generar errore al volverlo a usar*/
+	%DO;
+		PROC DELETE DATA=work.PARAM_ORIG;
+		RUN;
+	%END;
+
+	%IF %SYSFUNC(EXIST(work.RESUMEN)) %THEN
+	%DO;
+		PROC DELETE DATA=work.RESUMEN;
+		RUN;
+	%END;
+
+	%IF %SYSFUNC(EXIST(work.FINAL)) %THEN
+	%DO;
+		PROC DELETE DATA=work.FINAL;
+		RUN;
+	%END;
+
+	%IF %SYSFUNC(EXIST(work.FINAL_CI)) %THEN
+	%DO;
+		PROC DELETE DATA=work.FINAL_CI;
+		RUN;
+	%END;
+
+
+	%LET RECCOUNT=;
+	%GET_TABLE_SIZE(&Model_Data.,RECCOUNT); /*Mide el tamaño de la base para el tamaño del remuestreo*/
+
+
+
+	OPTIONS NOSYMBOLGEN NOMLOGIC NOMPRINT; /*Una opción para limitar el Log*/
+	
+	PROC GENMOD DATA=&Model_Data.;	/*Obtención de Parámetros Originales*/
+	&Class_Factor_Aux.;
+	MODEL &Var_Dep. = &Var_Indep. /DIST=&DIST. LINK=&LINK. &Offset_Aux.;
+		  &Weight_aux.;
+		ODS OUTPUT ParameterEstimates=Param_Orig;
+	RUN;
+
+	ods graphics off;/*Opciones para que no aparezcan tablas en la pestaña "Results" debido de los diferentes Bootstraps*/
+	ods exclude all;
+	ods noresults;
+
+	%DO i=1 %TO &N.; /*El número de Bootstraps*/
+		/*Remuestreo*/
+		/*METHOD=URS significa Unrestricted Random Sample, que es la metodología de Simple Random Sample with Replacement*/
+		/*La variable "Numberhits" cuenta las veces que la observación fue seleccionada para el Simple Random Sampling*/
+		/*Quitar la opción "Outhits" hace que solamente se eliga una observación aunque sea seleccionada varias veces por el Simple Random Sampling*/
+		/*La opción "Outhits", aunque permita elegir únicamente una observación del data set, guarda en la variable "Numberhits" las veces que esta seleccionó*/
+		/*Con la opción "Outhits" seleccionada, la variable "Numberhits" tiene hasta el límite de puesto en SAMPSIZE*/
+		/*Ejemplo:*/
+		/*OBS Value*/
+		/* 1    20 */
+		/* 2    43 */
+		/* 3    55 */
+		/*Se usa PROC SURVEYSELECT con OUTHITS para SAMPSIZE=3*/
+		/*OUTPUT DATASET*/
+		/* OBS Value NUMBERHITS*/
+		/*  2    43      1     */
+		/*  1    20      2     */
+		/*Aunque se especificó que el Re-Sampling debe de ser de tamaño 3 */
+		/*NUMBERHITS paró el remuestreo cuando la suma fue 3 (2+1) y no volvió a agregar la OBS=2, incluso cuando fue seleccionada dos veces*/
+		/*Si se selecciona OUTHITS, queda como sigue */
+		/* OBS Value NUMBERHITS*/
+		/*  2    43      1     */
+		/*  1    20      2     */
+		/*  1    20      3     */
+		PROC SURVEYSELECT DATA=&Model_Data. METHOD=URS SAMPSIZE=&RECCOUNT.
+   		REPS=1 OUT=RE_SAMPLE_&i. OUTHITS;
+		RUN;
+		
+		/*Se estima el modelo por cada Bootstrap*/
+		PROC GENMOD DATA=work.RE_SAMPLE_&i.;
+		&Class_Factor_Aux.;
+		MODEL &Var_Dep. =&Var_Indep. /DIST=&DIST. LINK=&LINK. &Offset_Aux.;
+		      &Weight_aux.;
+			ODS OUTPUT ParameterEstimates=param_re_sample_&i.;
+		RUN;
+		
+		/*Se queda con las variables importantes*/
+		DATA Temp_&i.;
+		RETAIN RE_SAMPLE;
+		SET param_re_sample_&i. (KEEP=Parameter &Level1_Aux. Estimate);
+			RE_SAMPLE=&i.;
+		RUN;
+		/*Pega el estimado y el número de remuestro a la base FINAL*/
+		PROC APPEND BASE=Final 
+					DATA=Temp_&i.; 
+		RUN;
+		/*Borra las bases*/
+		PROC DELETE DATA=Temp_&i.
+						 PARAM_RE_SAMPLE_&i.
+                         RE_SAMPLE_&i.;
+		RUN;
+	
+	%END;
+	/*Activa los gráficos*/
+	ods graphics on;
+	ods exclude none;
+	ods results;
+	
+	/*Calcula las métricas necesarias para el Intervalo de confianza con la metodología de estimación Normal, en específico la Media y la Desviación Standard Poblacional*/
+	PROC MEANS DATA=work.final NWAY NOPRINT MISSING;
+	CLASS Parameter &Level1_Aux.;
+	VAR Estimate;
+	OUTPUT OUT=Resumen (DROP=_:) MEAN(ESTIMATE)=Mean_Re STD(ESTIMATE)=Std_Re;
+    RUN;
+
+	PROC SORT DATA=PARAM_ORIG (RENAME=(Estimate=Estimado_Original));
+	BY Parameter &Level1_Aux.;
+	RUN;
+
+	PROC SORT DATA=Resumen;
+	BY Parameter &Level1_Aux.;
+	RUN;
+
+	DATA work.final_ci;
+	MERGE PARAM_ORIG (IN=A) Resumen (IN=B);
+	BY Parameter &Level1_Aux.;
+	IF A=B;
+		Bias=Mean_Re-Estimado_Original;
+		/*La metodología que inclía el sesgo (Bias) no se eligío dado que a veces el coeficiente original no se encontraba dentro del intervalo */
+		/*Int_Norm_Inf=(Estimado_Original-Bias)-QUANTILE('NORMAL',1-(&alpha./2))*(Std_Re);*/
+		/*Int_Norm_Sup=(Estimado_Original-Bias)+QUANTILE('NORMAL',1-(&alpha./2))*(Std_Re);*/
+		
+		Int_Norm_Inf=Estimado_Original-QUANTILE('NORMAL',1-(&alpha./2))*(Std_Re);
+		Int_Norm_Sup=Estimado_Original+QUANTILE('NORMAL',1-(&alpha./2))*(Std_Re);
+
+	RUN;
+	
+	/*Ordena la base a nivel Estimado para poder usar la información en el intervalo de confianza con Percentiles*/
+	PROC SORT DATA=FINAL;
+	BY Parameter &Level1_Aux. Estimate;
+	RUN;
+	/*Crea una Variable Auxiliar (AUX) que nos ayuda a agrupar todos los parámetros*/
+	%IF %LENGTH(&Class_Factor.) NE 0 %THEN
+	%DO;
+		DATA work.FINAL;
+		SET work.FINAL;
+			AUX=CATX('-Categoría-',Parameter,&Level1_Aux.);
+		RUN;
+	%END;
+
+	%ELSE
+	%DO;
+		DATA work.FINAL;
+		SET work.FINAL;
+			AUX=Parameter;
+		RUN;
+		
+	%END;
+	/*Empeiza una variable COUNT que nos cuenta el número de veces que aparece la variable AUX (Parámetros)*/
+	/*Esto se hac euna vez que ya se ordenaron los parámetros*/
+	/*Lo que hace es lo siguiente*/
+	/*RE_SAMPLE   AUX          Estimate       COUNT*/
+	/*	  1 	Intercept       +8.34           1      */
+	/*	  3 	Intercept       +8.80           2      */
+	/*	  2 	Intercept       +8.90           3      */
+	/*	  3 	Parametro_1     -0.55           1      */
+	/*	  1 	Parametro_1     -0.69           2      */
+	/*	  2 	Parametro_1     -0.70           3      */
+	/*Una vez ordenadas las variables, se selecciona aquella cuyo COUNT coincide con Upper o Lower*/
+	DATA work.FINAL_LOW work.FINAL_UPPER;
+	SET work.FINAL;
+		COUNT+1;
+	BY AUX;
+		IF FIRST.AUX THEN COUNT=1; 
+		IF COUNT=&Lower. THEN OUTPUT work.FINAL_LOW;/*Cuando el estimado del Bootstrap N sea elegido se guarda en una base, esto es por parámetro*/
+		IF COUNT=&Upper. THEN OUTPUT work.FINAL_Upper;
+	RUN;
+	/**/
+	PROC SORT DATA=work.FINAL_LOW ;
+	BY Parameter &Level1_Aux.;
+	RUN;
+
+	PROC SORT DATA=work.FINAL_UPPER;
+	BY Parameter &Level1_Aux.;
+	RUN;
+
+	PROC SORT DATA=work.final_ci;
+	BY Parameter &Level1_Aux.;
+	RUN;
+
+	DATA work.final_ci (DROP=AUX COUNT RE_SAMPLE RENAME=(Estimate=Int_Perc_Inf));
+	MERGE work.final_ci(IN=A) work.FINAL_LOW (IN=B);
+	BY Parameter &Level1_Aux.;
+	RUN;
+
+	DATA work.final_ci (DROP=COUNT RE_SAMPLE RENAME=(Estimate=Int_Perc_Sup));
+	MERGE work.final_ci (IN=A) work.FINAL_UPPER (IN=B);
+	BY Parameter &Level1_Aux.;
+	RUN;
+
+
+
+	DATA work.AUX_DATASET;
+	MERGE FINAL (IN=A) work.final_ci (IN=B);
+	BY Parameter &Level1_Aux.;
+	IF A=B;
+	RUN;
+
+
+	OPTIONS SYMBOLGEN MLOGIC MPRINT;
+	ods graphics / antialias=on antialiasmax=10000;
+
+	%IF %LENGTH(&Class_Factor.) NE 0 %THEN
+	/*%IF %SYSEVALF(%SUPERQ(Class_Factor)=,boolean) %THEN*/
+	%DO;
+
+		PROC SQL NOPRINT;
+		SELECT DISTINCT Parameter INTO :varlist separated by '","' /*Guarda en &varlist. aquellas categorías mayores a 2, las separa por coma*/
+		FROM work.Param_orig
+		WHERE Level1 IS NOT NULL
+		GROUP BY Parameter
+		HAVING COUNT(DISTINCT Level1) GT 2;
+		QUIT;
+
+		PROC SGPANEL DATA=work.final (WHERE=(Parameter IN ("&varlist.")));
+		PANELBY Parameter /COLUMNS=1 ROWS=1 UNISCALE=COLUMN;/*Hace que sólo aparezca 1 BOXPLOT*/
+		VBOX Estimate / CATEGORY=Level1; /*Calcula un BoxPlot vertical (VBox) por categoría LEvel1*/
+		refline 0/lineattrs=(pattern=dash thickness=2);/*Agrega como referencia el 0*/
+		TITLE 'Box-Plot de Variables Categóricas (más de 2 categorías)';
+		RUN;
+
+		PROC SGPANEL DATA=work.AUX_DATASET (WHERE=(Estimate NE 0 AND Parameter NE 'Scale'));
+		PANELBY AUX/COLUMNS=1 ROWS=1 UNISCALE=ROW;
+		HISTOGRAM Estimate /SCALE=COUNT;
+    	density estimate;
+		DENSITY Estimate/TYPE=KERNEL;
+		REFLINE Estimado_Original/AXIS=X LINEATTRS=(PATTERN=DASH THICKNESS=3 COLOR=BLACK);
+		REFLINE Int_Perc_Inf/AXIS=X LINEATTRS=(PATTERN=DASH THICKNESS=1 COLOR=BLACK);
+		REFLINE Int_Perc_Sup/AXIS=X LINEATTRS=(PATTERN=DASH THICKNESS=1 COLOR=BLACK);
+		TITLE 'Histograma por coeficiente (Se excluyen Coeficientes que tengan 0)';
+		RUN;
+	
+	%END;
+
+	%ELSE
+	%DO;
+		PROC SGPANEL DATA=work.AUX_DATASET (WHERE=(Estimate NE 0 AND Parameter NE 'Scale'));
+		PANELBY Parameter/COLUMNS=1 ROWS=1 UNISCALE=ROW;
+		HISTOGRAM Estimate /SCALE=COUNT;
+    	density estimate;
+		DENSITY Estimate/TYPE=KERNEL;
+		REFLINE Estimado_Original/AXIS=X LINEATTRS=(PATTERN=DASH THICKNESS=3 COLOR=BLACK);
+		REFLINE Int_Perc_Inf/AXIS=X LINEATTRS=(PATTERN=DASH THICKNESS=1 COLOR=BLACK);
+		REFLINE Int_Perc_Sup/AXIS=X LINEATTRS=(PATTERN=DASH THICKNESS=1 COLOR=BLACK);
+		TITLE 'Histograma por coeficiente (Se excluyen Coeficientes que tengan 0)';
+		RUN;
+
+	%END;
+
+	PROC DELETE DATA=work.RESUMEN
+					 work.PARAM_ORIG
+					 work.Final_Low
+					 work.Final_Upper;
+	RUN;
+
+	DATA work.FINAL_CI (DROP=AUX);
+	SET work.final_ci;
+	RUN;
+
+	DATA work.FINAL (DROP=AUX);
+	SET work.final;
+	RUN;
+
+	%IF %SYSFUNC(EXIST(work._SGSORT_)) %THEN
+	%DO;
+		PROC DELETE DATA=work._SGSORT_;
+		RUN;
+	%END;
+
+	%IF %SYSFUNC(EXIST(work.AUX_DATASET)) %THEN
+	%DO;
+		PROC DELETE DATA=work.AUX_DATASET;
+		RUN;
+	%END;
+
+	
+	data _null_; /*Detiene el contador y nos da el tiempo*/
+  	dur = datetime() - &Inicio ;
+  	put 30*'-' / ' DURACION :' dur time13.2 / 30*'-';
+	run;
+
+
+
+%MEND BOOTSTRAP_v3;
+
+	
+	
+
+%LET _CLIENTTASKLABEL=;
+%LET _CLIENTPROCESSFLOWNAME=;
+%LET _CLIENTPROJECTPATH=;
+%LET _CLIENTPROJECTPATHHOST=;
+%LET _CLIENTPROJECTNAME=;
+%LET _SASPROGRAMFILE=;
+%LET _SASPROGRAMFILEHOST=;
+
+
+/* TESTS*/
+
+
+proc reg data=sashelp.class;
+   model Weight = Height;
+run;
+
+%BOOTSTRAP_v3(Model_Data=sashelp.class,Var_Dep=weight,Var_Indep=height,N=1000,alpha=0.05,DIST=NORMAL,LINK=IDENTITY);
+
+%LET Class_Factor=Species;
+%LET Var_Indep=SepalWidth PetalLength PetalWidth Species;
+
+%BOOTSTRAP_v3(Model_Data=SASHELP.IRIS,
+              Var_Dep=SepalLength,
+              Var_Indep=&Var_Indep.,
+              N=11000,
+              Class_Factor=&Class_Factor.,
+              alpha=0.1,
+              DIST=NORMAL,
+              LINK=IDENTITY)
+
+
+
+
+
